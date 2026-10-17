@@ -9,7 +9,7 @@
  */
 
 /** Claude Code CLI version reported in the `User-Agent` header and the billing block. */
-export const CLAUDE_CODE_VERSION = "2.1.294";
+export const CLAUDE_CODE_VERSION = "2.1.302";
 
 /** `@anthropic-ai/sdk` version reported in `X-Stainless-Package-Version`. */
 export const SDK_PACKAGE_VERSION = "0.128.0";
