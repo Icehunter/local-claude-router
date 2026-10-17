@@ -1,4 +1,4 @@
-# claude-wire
+# local-claude-router
 
 OpenAI-compatible HTTP server over an Anthropic OAuth client. See README.md for usage.
 

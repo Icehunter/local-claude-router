@@ -757,7 +757,7 @@ function isDirectRun(): boolean {
 
 if (isDirectRun()) {
   main().catch((err) => {
-    process.stderr.write(`[claude-wire] fatal: ${(err as Error).message}\n`);
+    process.stderr.write(`[local-claude-router] fatal: ${(err as Error).message}\n`);
     process.exit(1);
   });
 }

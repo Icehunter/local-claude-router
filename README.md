@@ -1,4 +1,4 @@
-# claude-wire
+# local-claude-router
 
 An OpenAI-compatible HTTP server (`/v1/chat/completions`, `/v1/models`, `/health`) that sends your requests to Claude as a Claude Code-shaped request, authenticated with your subscription OAuth login.
 
@@ -46,3 +46,7 @@ npm run typecheck && npm test && npm run build
 ```
 
 TypeScript 7, ESM with `.js` import extensions, Vitest in `tests/`. TypeScript 7 does not auto-include `@types/*`; add any new one to `types` in `tsconfig.json`.
+
+## License
+
+Copyright (C) 2026 Ryan Wilson. Licensed under the GNU General Public License v3.0, see [LICENSE](LICENSE).

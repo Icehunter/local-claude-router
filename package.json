@@ -1,5 +1,5 @@
 {
-  "name": "claude-wire",
+  "name": "local-claude-router",
   "version": "0.2.0",
   "description": "OpenAI-compatible HTTP server for Claude via subscription OAuth",
   "type": "module",
@@ -26,5 +26,6 @@
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1"
-  }
+  },
+  "license": "GPL-3.0-only"
 }
