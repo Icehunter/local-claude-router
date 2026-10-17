@@ -1,0 +1,30 @@
+{
+  "name": "claude-wire",
+  "version": "0.2.0",
+  "description": "OpenAI-compatible HTTP server for Claude via subscription OAuth",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "start": "npm run build && node dist/openai-http.js",
+    "dev": "tsx watch src/openai-http.ts",
+    "login": "tsx src/cli.ts login",
+    "status": "tsx src/cli.ts status"
+  },
+  "dependencies": {
+    "pino": "^10.4.0",
+    "pino-pretty": "^13.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  }
+}
