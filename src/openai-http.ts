@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { responseTool } from "./response-tool.js";
 import { realpathSync } from "node:fs";
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
@@ -7,7 +10,8 @@ import { pino } from "pino";
 import type { Logger } from "pino";
 import pretty from "pino-pretty";
 import { APIStatusError } from "./anthropic/client.js";
-import type { Message, MessageRequest, MessageResult } from "./anthropic/client.js";
+import type { Message, MessageRequest, MessageResult, TextBlock } from "./anthropic/client.js";
+import { isHaikuModel } from "./anthropic/headers.js";
 import { depsFromEnv, MAX_MAX_TOKENS } from "./deps.js";
 import type { Deps } from "./deps.js";
 import {
@@ -16,7 +20,8 @@ import {
   readJson,
   sendError,
   sendJson,
-  toSseChunks,
+  sendSseError,
+  translateSSE,
 } from "./http-support.js";
 import type { ChatCompletion } from "./http-support.js";
 
@@ -73,22 +78,25 @@ const FINISH_REASONS: Readonly<Record<string, string>> = {
   max_tokens: "length",
   end_turn: "stop",
   stop_sequence: "stop",
+  refusal: "content_filter",
+  tool_use: "tool_calls",
+  pause_turn: "incomplete",
 };
 
 /** Finish reason used for stop reasons that have no entry in {@link FINISH_REASONS}. */
-const DEFAULT_FINISH_REASON = "stop";
+const DEFAULT_FINISH_REASON = "unknown";
 
 /** Dependencies and settings of the HTTP server. */
 export interface OpenAIHttpDeps {
   /** Upstream client that sends the translated request. */
-  readonly client: Pick<Deps["client"], "createMessage">;
+  readonly client: Pick<Deps["client"], "createMessage" | "createMessageStream">;
   /** Model used when the request names a non-Claude model. Also listed by `/v1/models`. */
   readonly defaultModel: string;
   /** `max_tokens` used when the request names none. */
   readonly defaultMaxTokens: number;
   /** When set, requests must carry `Authorization: Bearer <apiKey>`. */
   readonly apiKey?: string;
-  /** Thinking mode added to every upstream request. */
+  /** Fallback thinking mode when the request supplies no override. */
   readonly thinking?: MessageRequest["thinking"];
   /** Effort level added to every upstream request. */
   readonly effort?: MessageRequest["effort"];
@@ -119,22 +127,24 @@ const SILENT_LOG: Pick<Logger, "info" | "warn" | "error"> = {
  * @returns The text; parts are concatenated without a separator.
  * @throws {HttpError} 400 when the content is not text or text parts.
  */
-function contentText(content: OpenAIContent, where: string): string {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (!Array.isArray(content)) {
-    throw new HttpError(400, `${where}: content must be a string or an array of text parts`);
-  }
-  return content
-    .map((part) => {
-      if (part?.type !== "text" || typeof part.text !== "string") {
-        throw new HttpError(400, `${where}: only text content parts are supported`);
-      }
-      return part.text;
-    })
-    .join("");
+function cacheControl(value: unknown): { type: "ephemeral"; ttl?: "5m" } | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new HttpError(400, "unsupported cache_control");
+  const c = value as Record<string, unknown>;
+  if (c.type !== "ephemeral" || c.ttl !== undefined && c.ttl !== "5m" || Object.keys(c).some(k => k !== "type" && k !== "ttl")) throw new HttpError(400, "unsupported cache_control");
+  return { type: "ephemeral", ...(c.ttl === "5m" ? { ttl: "5m" } : {}) };
 }
+function contentText(content: OpenAIContent, where: string): string | TextBlock[] {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) throw new HttpError(400, `${where}: content must be text`);
+  const parts: TextBlock[] = content.map(part => {
+    if (part?.type !== "text" || typeof part.text !== "string") throw new HttpError(400, `${where}: only text content parts are supported`);
+    const cache = cacheControl((part as unknown as Record<string, unknown>).cache_control);
+    return { type: "text", text: part.text, ...(cache ? { cache_control: cache } : {}) };
+  });
+  return parts.some(part => part.cache_control !== undefined) ? parts : parts.map(part => part.text).join("");
+}
+function blocks(content: string | TextBlock[]): TextBlock[] { return typeof content === "string" ? [{type:"text",text:content}] : content; }
 
 /**
  * Rejects fields this server cannot honor.
@@ -143,6 +153,9 @@ function contentText(content: OpenAIContent, where: string): string {
  * @throws {HttpError} 400 for tools, functions, `tool_choice`, or `n` other than 1.
  */
 function assertSupportedFeatures(body: Record<string, unknown>): void {
+  const allowed = new Set(["messages", "model", "max_tokens", "max_completion_tokens", "stream", "n", "thinking", "effort", "reasoning_effort", "cache_control", "response_format"]);
+  for (const key of Object.keys(body)) if (!allowed.has(key)) throw new HttpError(400, `unsupported request field: ${key}`);
+  if (body.stream !== undefined && typeof body.stream !== "boolean") throw new HttpError(400, "stream must be boolean");
   if (body.tools !== undefined || body.functions !== undefined || body.tool_choice !== undefined) {
     throw new HttpError(400, "tools and function calling are not supported");
   }
@@ -153,7 +166,7 @@ function assertSupportedFeatures(body: Record<string, unknown>): void {
 
 /** System text and conversation turns split out of an OpenAI `messages` array. */
 interface SplitMessages {
-  readonly system: string[];
+  readonly system: TextBlock[];
   readonly messages: Message[];
 }
 
@@ -169,14 +182,14 @@ interface SplitMessages {
  * @throws {HttpError} 400 for non-text content or an unsupported role.
  */
 function splitMessages(rawMessages: unknown[]): SplitMessages {
-  const system: string[] = [];
+  const system: TextBlock[] = [];
   const messages: Message[] = [];
   rawMessages.forEach((raw, index) => {
     const message = raw as { role?: string; content?: OpenAIContent };
     const where = `messages[${index}]`;
     const text = contentText(message?.content, where);
     if (message.role === "system" || message.role === "developer") {
-      system.push(text);
+      system.push(...blocks(text));
       return;
     }
     if (message.role !== "user" && message.role !== "assistant") {
@@ -184,7 +197,7 @@ function splitMessages(rawMessages: unknown[]): SplitMessages {
     }
     const last = messages[messages.length - 1];
     if (last && last.role === message.role) {
-      last.content = `${last.content as string}\n\n${text}`;
+      last.content = typeof last.content === "string" && typeof text === "string" ? `${last.content}\n\n${text}` : [...blocks(last.content as string | TextBlock[]), {type:"text",text:"\n\n"}, ...blocks(text)];
       return;
     }
     messages.push({ role: message.role, content: text });
@@ -218,6 +231,7 @@ function assertUserBookends(messages: Message[]): void {
  * @throws {HttpError} 400 when the value is not an integer in range.
  */
 function resolveMaxTokens(body: Record<string, unknown>, defaultMaxTokens: number): number {
+  if (body.max_completion_tokens !== undefined && body.max_tokens !== undefined && body.max_completion_tokens !== body.max_tokens) throw new HttpError(400, "conflicting output token limits");
   const raw = body.max_completion_tokens ?? body.max_tokens ?? defaultMaxTokens;
   const isValid = typeof raw === "number" && Number.isInteger(raw) && raw >= 1 && raw <= MAX_MAX_TOKENS;
   if (!isValid) {
@@ -229,17 +243,20 @@ function resolveMaxTokens(body: Record<string, unknown>, defaultMaxTokens: numbe
 /**
  * Picks the upstream model.
  *
- * Clients default to names like "gpt-4o"; anything that is not a Claude id gets
- * the default model.
+ * Any non-empty model string is passed through to the upstream API so clients
+ * can target any Claude model (e.g. "claude-haiku-4-5") instead of only the
+ * configured default. The upstream API is the source of truth for model
+ * validity; unknown names surface as an error response.
  *
  * @param requested - The request's `model` field.
- * @param defaultModel - Model used for non-Claude names.
- * @returns A Claude model id.
+ * @param defaultModel - Model used when none is supplied.
+ * @returns The model id to send upstream.
  */
 function resolveModel(requested: unknown, defaultModel: string): string {
-  if (typeof requested === "string" && requested.startsWith("claude")) {
+  if (typeof requested === "string" && requested.trim().length > 0) {
     return requested;
   }
+  if (requested !== undefined) throw new HttpError(400, "model must be a non-empty string");
   return defaultModel;
 }
 
@@ -248,9 +265,8 @@ function resolveModel(requested: unknown, defaultModel: string): string {
  *
  * Notes on fields:
  *
- * - `temperature` is accepted but never forwarded: the upstream rejects it as
- *   deprecated (HTTP 400) for current models.
- * - `model` names that do not start with `claude` are replaced by the default.
+ * - Unsupported behavioral fields, including temperature, are rejected.
+ * - Explicit models must match the configured model (optionally with [1m]).
  * - `system` and `developer` messages become the system prompt, joined by a blank line.
  *
  * @param body - Parsed JSON body of `POST /v1/chat/completions`.
@@ -283,9 +299,21 @@ export function translateRequest(
     model: resolveModel(body.model, defaults.defaultModel),
     maxTokens,
     messages,
+    ...(body.cache_control !== undefined ? { cacheControl: cacheControl(body.cache_control) } : {}),
   };
   if (system.length > 0) {
-    request.system = system.join("\n\n");
+    request.system = system.some(block => block.cache_control !== undefined) ? system : system.map(block => block.text).join("\n\n");
+  }
+  const schema = responseTool(body.response_format);
+  if (schema) {
+    request.tools = [{name:"respond",description:"Return the requested JSON result.",input_schema:schema.schema}];
+    request.toolChoice = {type:"auto"};
+    request.responseTool = "respond";
+    request.responseEnvelope = schema.envelope;
+    const instruction = schema.envelope
+      ? 'Use the respond tool exactly once. Put the requested JSON object in its required result property. Do not return the result as plain text.'
+      : 'Use the respond tool exactly once to return the requested JSON result. Its input is the result. Do not return the result as plain text.';
+    request.system = request.system === undefined ? instruction : typeof request.system === "string" ? request.system + "\n\n" + instruction : [...request.system,{type:"text",text:instruction}];
   }
   return request;
 }
@@ -307,7 +335,7 @@ function responseText(result: MessageResult): string {
  * Converts an upstream message response to an OpenAI `chat.completion`.
  *
  * `stop_reason` maps to `finish_reason` through {@link FINISH_REASONS}; anything
- * unknown becomes `stop`. Missing usage counts as zero.
+ * unknown remains unknown. Missing usage remains null.
  *
  * @param result - Upstream result.
  * @param created - Creation time in epoch seconds.
@@ -317,10 +345,20 @@ function responseText(result: MessageResult): string {
  * const completion = toChatCompletion(await client.createMessage(request), Math.floor(Date.now() / 1000));
  * ```
  */
-export function toChatCompletion(result: MessageResult, created: number): ChatCompletion {
+export function toChatCompletion(result: MessageResult, created: number, expectedTool?: string, envelope=false): ChatCompletion {
   const { response } = result;
-  const input = response.usage?.input_tokens ?? 0;
-  const output = response.usage?.output_tokens ?? 0;
+  const rawUsage = response.usage;
+  const valid = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+  const cacheCreated = rawUsage?.cache_creation_input_tokens ?? 0;
+  const cacheRead = rawUsage?.cache_read_input_tokens ?? 0;
+  const usage = rawUsage && valid(rawUsage.input_tokens) && valid(rawUsage.output_tokens) && valid(cacheCreated) && valid(cacheRead)
+    ? { prompt_tokens: rawUsage.input_tokens + cacheCreated + cacheRead, completion_tokens: rawUsage.output_tokens, total_tokens: rawUsage.input_tokens + cacheCreated + cacheRead + rawUsage.output_tokens } : null;
+  const blockTypes = response.content.map(block => block.type);
+  const toolBlocks = response.content.filter(block => block.type === "tool_use");
+  const tool = toolBlocks.length === 1 && toolBlocks[0]!.name === expectedTool && typeof toolBlocks[0]!.input === "object" && toolBlocks[0]!.input !== null && !Array.isArray(toolBlocks[0]!.input) ? toolBlocks[0] : undefined;
+  const envelopeValid = !envelope || tool !== undefined && Object.keys(tool.input as object).length === 1 && Object.hasOwn(tool.input as object,"result") && typeof (tool.input as Record<string,unknown>).result === "object" && (tool.input as Record<string,unknown>).result !== null && !Array.isArray((tool.input as Record<string,unknown>).result);
+  const validTool = envelopeValid && tool !== undefined && response.stop_reason === "tool_use" && blockTypes.every(type=>["text","thinking","redacted_thinking","tool_use"].includes(type));
+  const unexpected = blockTypes.some(type => !["text", "thinking", "redacted_thinking"].includes(type));
   return {
     id: `chatcmpl-${response.id}`,
     object: "chat.completion",
@@ -329,11 +367,12 @@ export function toChatCompletion(result: MessageResult, created: number): ChatCo
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content: responseText(result) },
-        finish_reason: FINISH_REASONS[response.stop_reason ?? ""] ?? DEFAULT_FINISH_REASON,
+        message: { role: "assistant", content: expectedTool ? validTool ? JSON.stringify(envelope ? (tool!.input as Record<string,unknown>).result : tool!.input) : "" : responseText(result) },
+        finish_reason: expectedTool ? validTool ? "stop" : "unsupported_content" : unexpected ? "unsupported_content" : FINISH_REASONS[response.stop_reason ?? ""] ?? DEFAULT_FINISH_REASON,
       },
     ],
-    usage: { prompt_tokens: input, completion_tokens: output, total_tokens: input + output },
+    usage,
+    upstream: { request_id: result.requestId, stop_reason: response.stop_reason, block_types: blockTypes, usage: rawUsage ?? null },
   };
 }
 
@@ -413,7 +452,8 @@ function relayedStatus(err: APIStatusError): number {
  */
 function sendFailure(response: ServerResponse, err: unknown): void {
   if (response.headersSent) {
-    response.end();
+    const type = err instanceof APIStatusError ? err.errorType ?? "api_error" : "api_error";
+    sendSseError(response, (err as Error)?.message ?? "upstream request failed", type);
     return;
   }
   if (err instanceof HttpError) {
@@ -432,18 +472,87 @@ function sendFailure(response: ServerResponse, err: unknown): void {
  *
  * @param body - Parsed request body.
  * @param deps - Server settings.
- * @returns The translated request with the configured thinking and effort added.
+ * @returns The translated request with validated thinking and effort overrides, falling back to server settings.
  * @throws {HttpError} 400 when the body is invalid.
  */
 function buildUpstreamRequest(body: Record<string, unknown>, deps: OpenAIHttpDeps): MessageRequest {
   const request = translateRequest(body, deps);
-  if (deps.thinking) {
+  if (body.thinking !== undefined) {
+    const thinking = body.thinking;
+    if (typeof thinking !== "object" || thinking === null || Array.isArray(thinking)
+      || Object.keys(thinking).length !== 1 || !("type" in thinking)
+      || (thinking.type !== "adaptive" && thinking.type !== "between_tools")) {
+      throw new HttpError(400, "thinking must be an object with only type: adaptive or between_tools");
+    }
+    request.thinking = { type: thinking.type };
+  } else if (deps.thinking && !isHaikuModel(request.model)) {
     request.thinking = deps.thinking;
   }
-  if (deps.effort) {
-    request.effort = deps.effort;
+  for (const field of ["effort", "reasoning_effort"] as const) {
+    const value = body[field];
+    if (value !== undefined && (typeof value !== "string" || !isEffort(value))) {
+      throw new HttpError(400, `${field} must be one of ${EFFORTS.join(", ")}`);
+    }
+  }
+  if (body.effort !== undefined && body.reasoning_effort !== undefined && body.effort !== body.reasoning_effort) {
+    throw new HttpError(400, "effort and reasoning_effort must agree when both are supplied");
+  }
+  const effort = body.effort ?? body.reasoning_effort ?? deps.effort;
+  if (effort !== undefined) {
+    request.effort = effort as Effort;
   }
   return request;
+}
+
+/**
+ * Streams a chat completion as OpenAI `chat.completion.chunk` SSE.
+ *
+ * The upstream Anthropic SSE events are translated live by {@link translateSSE}
+ * and written to the response. The shared abort signal is aborted when the
+ * client disconnects, which cancels the upstream call.
+ *
+ * @param request - Upstream request, already carrying `stream: true`.
+ * @param response - Response to write.
+ * @param deps - Server settings.
+ * @param abort - Shared abort controller, aborted on client disconnect.
+ * @param now - Clock in epoch seconds.
+ * @param detail - Log fields, mutated in place.
+ */
+async function handleStream(
+  request: MessageRequest,
+  response: ServerResponse,
+  deps: OpenAIHttpDeps,
+  abort: AbortController,
+  now: () => number,
+  detail: RequestLogDetail,
+): Promise<void> {
+  detail.upstreamAttempts = 1;
+  response.setHeader("x-claude-wire-upstream-attempts", "1");
+  response.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    "connection": "keep-alive",
+  });
+  const completionId = randomUUID();
+  try {
+    for await (const line of translateSSE(
+      deps.client.createMessageStream(request, abort.signal),
+      completionId,
+      request.model,
+      now(),
+    )) {
+      response.write(line);
+      if (!response.write("")) {
+        await once(response, "drain");
+      }
+    }
+  } catch (err) {
+    sendFailure(response, err);
+  } finally {
+    if (!response.writableEnded) {
+      response.end();
+    }
+  }
 }
 
 /**
@@ -480,15 +589,24 @@ async function handleChatCompletion(
       abort.abort();
     }
   });
-  const completion = toChatCompletion(await deps.client.createMessage(request, abort.signal), now());
-
-  detail.finish = completion.choices[0]!.finish_reason;
-  detail.tokens = `${completion.usage.prompt_tokens} in / ${completion.usage.completion_tokens} out`;
 
   if (isStream) {
-    response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" }).end(toSseChunks(completion));
-    return;
+    return handleStream(request, response, deps, abort, now, detail);
   }
+
+  const singleAttempt = incomingRequest.headers["x-pinkie-single-attempt"] === "1";
+  let upstreamAttempts = 0;
+  const result = singleAttempt
+    ? await deps.client.createMessage(request, abort.signal, { singleAttempt: true, onAttempt: () => {
+        upstreamAttempts++;
+        detail.upstreamAttempts = upstreamAttempts;
+        response.setHeader("x-claude-wire-upstream-attempts", String(upstreamAttempts));
+      } })
+    : await deps.client.createMessage(request, abort.signal);
+  const completion = toChatCompletion(result, now(), request.responseTool, request.responseEnvelope);
+
+  detail.finish = completion.choices[0]!.finish_reason;
+  detail.tokens = completion.usage ? `${completion.usage.prompt_tokens} in / ${completion.usage.completion_tokens} out` : "unknown";
   sendJson(response, 200, completion);
 }
 

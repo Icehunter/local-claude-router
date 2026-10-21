@@ -15,7 +15,7 @@ export const MAX_MAX_TOKENS = 128_000;
 /** The wired-up services shared by the CLI and the HTTP server. */
 export interface Deps {
   readonly credentials: CredentialManager;
-  readonly client: Pick<AnthropicClient, "createMessage">;
+  readonly client: Pick<AnthropicClient, "createMessage" | "createMessageStream">;
   readonly login: Pick<LoginController, "start" | "state" | "settled">;
   /** Model used when a request does not name a Claude model. */
   readonly defaultModel: string;

@@ -96,12 +96,24 @@ export function stainlessArch(arch: string = process.arch): string {
  * @returns The set of denied flags, or null when the model has no model-specific denials.
  */
 export function betaDenylistForModel(model: string): Set<string> | null {
-  const lower = model.slice(model.lastIndexOf("/") + 1).toLowerCase();
-  const isHaiku = HAIKU_PREFIXES.some((prefix) => lower.startsWith(prefix));
-  if (isHaiku) {
+  if (isHaikuModel(model)) {
     return new Set([CONTEXT_1M_BETA, INTERLEAVED_THINKING_BETA]);
   }
   return null;
+}
+
+/**
+ * Checks whether a model id names a Haiku model.
+ *
+ * Haiku models do not support extended thinking (`between_tools` or `adaptive`),
+ * so the router must not send a thinking override for them.
+ *
+ * @param model - Model id, optionally prefixed with a provider path (`a/b/model`).
+ * @returns True when the model is a Haiku model.
+ */
+export function isHaikuModel(model: string): boolean {
+  const lower = model.slice(model.lastIndexOf("/") + 1).toLowerCase();
+  return HAIKU_PREFIXES.some((prefix) => lower.startsWith(prefix));
 }
 
 /**

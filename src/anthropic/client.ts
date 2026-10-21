@@ -7,8 +7,10 @@ import { BASE_API_URL, IDENTITY_SYSTEM } from "./wire.js";
 
 /** A text content block. */
 export interface TextBlock {
+  [key: string]: unknown;
   type: "text";
   text: string;
+  cache_control?: { type: "ephemeral"; ttl?: "5m" };
 }
 
 /** A content block of any type. Only `text` blocks are read by this server. */
@@ -26,6 +28,11 @@ export interface Message {
 
 /** A request for one assistant message, in the shape this client accepts. */
 export interface MessageRequest {
+  responseTool?: string;
+  responseEnvelope?: boolean;
+  tools?: {name: string; description: string; input_schema: Record<string, unknown>}[];
+  toolChoice?: {type: "auto"};
+  cacheControl?: { type: "ephemeral"; ttl?: "5m" };
   model: string;
   maxTokens: number;
   messages: Message[];
@@ -43,6 +50,8 @@ export interface MessageRequest {
   thinking?: { type: "adaptive" | "between_tools" };
   /** Effort level, sent as `output_config.effort`. */
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  /** When true, the upstream call is a streaming request. */
+  stream?: boolean;
 }
 
 /** The subset of the upstream message response that this server reads. */
@@ -60,6 +69,12 @@ export interface MessageResponse {
 export interface MessageResult {
   response: MessageResponse;
   requestId: string | null;
+}
+
+/** One decoded server-sent event from a streaming upstream response. */
+export interface SSEEvent {
+  readonly event: string;
+  readonly data: string;
 }
 
 /** Non-2xx answer from the API. */
@@ -286,6 +301,9 @@ function buildRequestBody(request: MessageRequest, promptId: string): string {
       ...systemBlocks(request.system),
     ],
     messages: request.messages,
+    ...(request.stream ? { stream: true } : {}),
+    ...(request.tools ? {tools:request.tools,tool_choice:request.toolChoice} : {}),
+    ...(request.cacheControl ? { cache_control: request.cacheControl } : {}),
   };
   if (request.temperature !== undefined) {
     body.temperature = request.temperature;
@@ -331,6 +349,80 @@ async function toStatusError(httpResponse: Response): Promise<APIStatusError> {
 }
 
 /**
+ * Decodes a response body into server-sent events.
+ *
+ * Each event is a block of `event:` and `data:` lines separated by a blank
+ * line. `data:` lines are yielded as-is; multiple `data:` lines in one event
+ * are not expected by the upstream API and are concatenated with a newline.
+ *
+ * @param body - A readable stream of UTF-8 text, or a string.
+ * @returns An async iterable of parsed events.
+ */
+async function* parseSSEStream(
+  body: ReadableStream<Uint8Array> | string,
+  signal?: AbortSignal,
+): AsyncGenerator<SSEEvent> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const feed = (chunk: Uint8Array): void => {
+    buffer += decoder.decode(chunk, { stream: true });
+  };
+
+  const parseBlock = (block: string): SSEEvent => {
+    let event = "";
+    let data = "";
+    for (const line of block.split("\n")) {
+      if (line.startsWith("event: ")) {
+        event = line.slice("event: ".length);
+      } else if (line.startsWith("data: ")) {
+        data = data === "" ? line.slice("data: ".length) : `${data}\n${line.slice("data: ".length)}`;
+      }
+    }
+    return { event, data };
+  };
+
+  const emit = async function* (): AsyncGenerator<SSEEvent> {
+    while (true) {
+      const separatorIndex = buffer.indexOf("\n\n");
+      if (separatorIndex === -1) break;
+      yield parseBlock(buffer.slice(0, separatorIndex));
+      buffer = buffer.slice(separatorIndex + 2);
+    }
+    const remaining = buffer.trim();
+    buffer = "";
+    if (remaining !== "") {
+      yield parseBlock(remaining);
+    }
+  };
+
+  if (typeof body === "string") {
+    buffer = body;
+    yield* emit();
+    return;
+  }
+
+  const reader = body.getReader();
+  try {
+    for (;;) {
+      const read = reader.read();
+      const aborted = signal
+        ? new Promise<{ value?: Uint8Array; done: boolean }>((_, reject) => {
+            if (signal.aborted) return reject(new Error("request cancelled by the caller"));
+            signal.addEventListener("abort", () => reject(new Error("request cancelled by the caller")), { once: true });
+          })
+        : undefined;
+      const result = aborted ? await Promise.race([read, aborted]) : await read;
+      if (result.done) break;
+      if (result.value) feed(result.value);
+      yield* emit();
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
  * Decides whether to authenticate with the API key rather than the access token.
  *
  * @param credentials - Resolved credentials.
@@ -362,6 +454,11 @@ function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortS
  * retries transient failures with backoff, and retries once with refreshed
  * credentials after a 401.
  */
+export interface ClientCallOptions {
+  readonly singleAttempt?: boolean;
+  readonly onAttempt?: () => void;
+}
+
 export class AnthropicClient {
   private readonly fetchImpl: FetchLike;
   private readonly baseUrl: string;
@@ -402,16 +499,16 @@ export class AnthropicClient {
    * });
    * ```
    */
-  public async createMessage(request: MessageRequest, signal?: AbortSignal): Promise<MessageResult> {
+  public async createMessage(request: MessageRequest, signal?: AbortSignal, callOptions: ClientCallOptions = {}): Promise<MessageResult> {
     const promptId = randomUUID();
     const body = buildRequestBody(request, promptId);
 
     let credentials = await this.options.credentials.get();
-    let httpResponse = await this.sendWithRetry(request.model, body, credentials, promptId, signal);
-    if (httpResponse.status === 401) {
+    let httpResponse = await this.sendWithRetry(request.model, body, credentials, promptId, signal, callOptions);
+    if (httpResponse.status === 401 && !callOptions.singleAttempt) {
       await httpResponse.body?.cancel();
       credentials = await this.options.credentials.refreshAfter401(credentials.accessToken || credentials.apiKey || "");
-      httpResponse = await this.sendWithRetry(request.model, body, credentials, promptId, signal);
+      httpResponse = await this.sendWithRetry(request.model, body, credentials, promptId, signal, callOptions);
     }
     if (!httpResponse.ok) {
       throw await toStatusError(httpResponse);
@@ -424,6 +521,45 @@ export class AnthropicClient {
       throw new Error(`api: decode response: ${(err as Error).message}`);
     }
     return { response, requestId: httpResponse.headers.get("request-id") };
+  }
+
+  /**
+   * Sends a message request as a stream and yields the upstream SSE events.
+   *
+   * Streaming calls are not retried: a failure would lose the stream, so the
+   * first response is final. A 401 is answered by refreshing credentials and
+   * sending the request once more. The caller must iterate the returned
+   * generator to completion so the connection is released.
+   *
+   * @param request - The request, with `stream` set to `true`.
+   * @param signal - Aborts the call; an abort surfaces as `request cancelled`.
+   * @returns An async iterable of upstream SSE events.
+   * @throws {APIStatusError} When the API answers with a non-2xx status.
+   */
+  public async *createMessageStream(
+    request: MessageRequest,
+    signal?: AbortSignal,
+  ): AsyncGenerator<SSEEvent> {
+    if (signal?.aborted) {
+      throw new Error("request cancelled by the caller");
+    }
+    const promptId = randomUUID();
+    const body = buildRequestBody({ ...request, stream: true }, promptId);
+
+    let credentials = await this.options.credentials.get();
+    let httpResponse = await this.sendOnce(request.model, body, credentials, promptId, signal);
+    if (httpResponse.status === 401) {
+      await httpResponse.body?.cancel();
+      credentials = await this.options.credentials.refreshAfter401(credentials.accessToken || credentials.apiKey || "");
+      httpResponse = await this.sendOnce(request.model, body, credentials, promptId, signal);
+    }
+    if (!httpResponse.ok) {
+      throw await toStatusError(httpResponse);
+    }
+    if (!httpResponse.body) {
+      throw new Error("api: streaming response has no body");
+    }
+    yield* parseSSEStream(httpResponse.body, signal);
   }
 
   /**
@@ -485,11 +621,14 @@ export class AnthropicClient {
     credentials: ResolvedCreds,
     promptId: string,
     signal?: AbortSignal,
+    callOptions: ClientCallOptions = {},
   ): Promise<Response> {
     for (let attempt = 0; ; attempt++) {
       let failure: Error;
       let hintMs = 0;
       try {
+        if (signal?.aborted) throw new Error("request cancelled by the caller");
+        callOptions.onAttempt?.();
         const httpResponse = await this.sendOnce(model, body, credentials, promptId, signal);
         const isFinal = httpResponse.status < 400 || httpResponse.status === 401 || !shouldRetryStatus(httpResponse.status, httpResponse.headers.get("x-should-retry"));
         if (isFinal) {
@@ -508,7 +647,7 @@ export class AnthropicClient {
           failure = new Error(`api: send: ${(err as Error).message}`);
         }
       }
-      if (attempt >= this.maxRetries) {
+      if (attempt >= (callOptions.singleAttempt ? 0 : this.maxRetries)) {
         throw failure;
       }
       const delay = backoffMs(attempt, hintMs, this.random);

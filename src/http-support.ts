@@ -4,6 +4,16 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 /** Largest request body accepted (8 MiB). Larger bodies are answered with 413. */
 export const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
+/** Maps upstream stop reasons to OpenAI finish reasons. Unknown reasons become `unknown`. */
+const FINISH_REASONS: Readonly<Record<string, string>> = {
+  max_tokens: "length",
+  end_turn: "stop",
+  stop_sequence: "stop",
+  refusal: "content_filter",
+  tool_use: "tool_calls",
+  pause_turn: "incomplete",
+};
+
 /** `error.type` used for malformed or unsupported requests. */
 export const INVALID_REQUEST_ERROR = "invalid_request_error";
 
@@ -48,11 +58,12 @@ export interface ChatCompletion {
   readonly created: number;
   readonly model: string;
   readonly choices: readonly ChatCompletionChoice[];
+  readonly upstream?: { readonly request_id: string | null; readonly stop_reason: string | null; readonly block_types: string[]; readonly usage: unknown };
   readonly usage: {
     readonly prompt_tokens: number;
     readonly completion_tokens: number;
     readonly total_tokens: number;
-  };
+  } | null;
 }
 
 /**
@@ -83,9 +94,110 @@ export function toSseChunks(completion: ChatCompletion): string {
   };
   const last = {
     ...base,
+    usage: completion.usage,
+    ...(completion.upstream ? {upstream: completion.upstream} : {}),
     choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason }],
   };
   return `data: ${JSON.stringify(first)}\n\ndata: ${JSON.stringify(last)}\n\ndata: [DONE]\n\n`;
+}
+
+/**
+ * Translates upstream Anthropic SSE events into OpenAI `chat.completion.chunk`
+ * stream lines.
+ *
+ * The generator yields `data: <json>\n\n` lines in this order: a role chunk on
+ * `message_start`, one content chunk per text delta, a single `tool_calls`
+ * delta when a tool_use block stops, a finish-reason chunk on `message_delta`,
+ * a usage chunk, and finally the `[DONE]` sentinel. Events the translator does
+ * not recognise are skipped.
+ *
+ * @param upstreamEvents - An async iterable of `{ event, data }` pairs.
+ * @param completionId - OpenAI id echoed on every chunk.
+ * @param model - Model id echoed on every chunk.
+ * @param created - Creation time in epoch seconds, echoed on every chunk.
+ * @returns An async generator of SSE lines to write to the response.
+ */
+export async function* translateSSE(
+  upstreamEvents: AsyncIterable<{ event: string; data: string }>,
+  completionId: string,
+  model: string,
+  created: number,
+): AsyncGenerator<string> {
+  const base = {
+    id: completionId,
+    object: "chat.completion.chunk",
+    created,
+    model,
+  };
+
+  const emit = (choices: unknown[], usage?: unknown): string =>
+    `data: ${JSON.stringify({ ...base, choices, ...(usage ? { usage } : {}) })}\n\n`;
+
+  let toolId = "";
+  let toolName = "";
+  let toolArgs = "";
+  let stopReason: string | null = null;
+  let inputTokens = 0;
+  let outputTokens = 0;
+
+  const parse = (data: string): Record<string, unknown> => {
+    try {
+      return JSON.parse(data) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  };
+
+  for await (const { event, data } of upstreamEvents) {
+    const parsed = parse(data);
+    const delta = parsed.delta as Record<string, unknown> | undefined;
+
+    if (event === "message_start") {
+      const usage = parsed.usage as { input_tokens?: number; output_tokens?: number } | undefined;
+      if (usage) {
+        inputTokens = usage.input_tokens ?? 0;
+        outputTokens = usage.output_tokens ?? 0;
+      }
+      yield emit([{ index: 0, delta: { role: "assistant" }, finish_reason: null }]);
+    } else if (event === "content_block_start") {
+      const block = parsed.content_block as { type?: string; id?: string; name?: string } | undefined;
+      if (block?.type === "tool_use") {
+        toolId = block.id ?? "";
+        toolName = block.name ?? "";
+        toolArgs = "";
+      }
+    } else if (event === "content_block_delta") {
+      if (delta?.type === "text_delta") {
+        yield emit([{ index: 0, delta: { content: String(delta.text ?? "") }, finish_reason: null }]);
+      } else if (delta?.type === "input_json_delta") {
+        toolArgs += String(delta.partial_json ?? "");
+      }
+    } else if (event === "content_block_stop") {
+      if (toolId !== "") {
+        yield emit([{ index: 0, delta: { tool_calls: [{ index: 0, id: toolId, type: "function", function: { name: toolName, arguments: toolArgs } }] }, finish_reason: null }]);
+        toolId = "";
+        toolName = "";
+        toolArgs = "";
+      }
+    } else if (event === "message_delta") {
+      const d = (delta?.delta ?? delta) as Record<string, unknown>;
+      stopReason = d.stop_reason as string | null;
+      const usage = d.usage as { input_tokens?: number; output_tokens?: number } | undefined;
+      if (usage) {
+        inputTokens = usage.input_tokens ?? inputTokens;
+        outputTokens = usage.output_tokens ?? outputTokens;
+      }
+      if (stopReason !== null) {
+        yield emit([{ index: 0, delta: {}, finish_reason: FINISH_REASONS[stopReason] ?? "unknown" }], {
+          prompt_tokens: inputTokens,
+          completion_tokens: outputTokens,
+          total_tokens: inputTokens + outputTokens,
+        });
+      }
+    }
+    // Other events are ignored.
+  }
+  yield "data: [DONE]\n\n";
 }
 
 /**
@@ -109,6 +221,22 @@ export function sendJson(response: ServerResponse, status: number, body: unknown
  */
 export function sendError(response: ServerResponse, status: number, message: string, type: string): void {
   sendJson(response, status, { error: { message, type, param: null, code: null } });
+}
+
+/**
+ * Writes an OpenAI-style SSE error event and ends the response.
+ *
+ * A streaming response has already sent its 200 headers, so it can no longer
+ * return an HTTP error status. The error is delivered as an `event: error`
+ * line (matching how OpenAI surfaces stream errors) instead of an empty body.
+ *
+ * @param response - Streaming response that has already started.
+ * @param message - Message shown to the client.
+ * @param type - OpenAI `error.type`.
+ */
+export function sendSseError(response: ServerResponse, message: string, type: string): void {
+  response.write(`event: error\ndata: ${JSON.stringify({ error: { message, type, param: null, code: null } })}\n\n`);
+  response.end();
 }
 
 /**
