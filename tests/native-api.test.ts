@@ -1,0 +1,30 @@
+import {it,expect} from 'vitest';
+import type {AddressInfo} from 'node:net';
+import {createNativeApiProxy} from '../src/native-api.js';
+async function run(fetchImpl:typeof fetch,body:string,extra:Record<string,string>={},timeoutMs=1000){
+ const server=createNativeApiProxy({apiKey:'synthetic-test-key',workspaceId:'synthetic-workspace',localBearerToken:'local-test-token',authorizeDispatch:async()=>{},fetch:fetchImpl,timeoutMs});await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));
+ try{return await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/messages`,{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer local-test-token',...extra},body});}finally{await new Promise<void>(r=>server.close(()=>r()));}
+}
+it('preserves native bytes and metadata without injected text or client credentials',async()=>{
+ const body=' { "model":"claude-sonnet-5-5", "messages":[], "cache_control":{"type":"ephemeral"} } ';const reply=' {"stop_reason":"refusal", "usage":{"cache_read_input_tokens":99}} ';let calls=0;
+ const response=await run(async(url,init)=>{calls++;expect(String(url)).toBe('https://api.anthropic.com/v1/messages');expect(Buffer.from(init!.body as Uint8Array).toString()).toBe(body);const h=new Headers(init!.headers);expect(h.get('x-api-key')).toBe('synthetic-test-key');expect(h.get('anthropic-workspace-id')).toBe('synthetic-workspace');expect(h.get('anthropic-version')).toBe('2023-06-01');expect(h.get('authorization')).toBeNull();expect(h.get('anthropic-beta')).toBe('example-beta');return new Response(reply,{status:200,headers:{'content-type':'application/json','request-id':'r'}});},body,{'anthropic-beta':'example-beta'});
+ expect(calls).toBe(1);expect(response.headers.get('request-id')).toBe('r');expect(await response.text()).toBe(reply);
+});
+it('forwards upstream errors once without retry',async()=>{let n=0;const r=await run(async()=>{n++;return new Response('{"error":"busy"}',{status:429,headers:{'retry-after':'2'}});},'{}');expect(n).toBe(1);expect(r.status).toBe(429);expect(r.headers.get('retry-after')).toBe('2');expect(await r.text()).toBe('{"error":"busy"}');});
+it('aborts timed out upstream without exposing exception text',async()=>{let aborted=false;const r=await run(async(_u,init)=>new Promise((_resolve,reject)=>init!.signal!.addEventListener('abort',()=>{aborted=true;reject(new Error('synthetic-test-key'));})), '{}',{},20);expect(r.status).toBe(504);expect(aborted).toBe(true);expect(await r.text()).not.toContain('synthetic-test-key');});
+it('rejects invalid credentials and oversized deadline configuration without echoing values',()=>{expect(()=>createNativeApiProxy({apiKey:'bad\nkey',workspaceId:'w',localBearerToken:'local-test-token',authorizeDispatch:async()=>{}})).toThrow('invalid proxy configuration');expect(()=>createNativeApiProxy({apiKey:'k',workspaceId:'w',localBearerToken:'local-test-token',authorizeDispatch:async()=>{},timeoutMs:300001})).toThrow();});
+it('cancels the sole upstream request when the caller disconnects',async()=>{
+ let started!:()=>void;let cancelled!:()=>void;const began=new Promise<void>(r=>started=r);const stopped=new Promise<void>(r=>cancelled=r);let count=0;
+ const server=createNativeApiProxy({apiKey:'test-key',workspaceId:'test-workspace',localBearerToken:'local-test-token',authorizeDispatch:async()=>{},timeoutMs:1000,fetch:async(_u,init)=>{count++;started();return new Promise((_r,reject)=>init!.signal!.addEventListener('abort',()=>{cancelled();reject(new Error('cancelled'));}));}});await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));
+ try{const abort=new AbortController();const pending=fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/messages`,{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer local-test-token'},body:'{}',signal:abort.signal}).catch(()=>undefined);await began;abort.abort();await stopped;await pending;expect(count).toBe(1);}finally{await new Promise<void>(r=>server.close(()=>r()));}
+});
+it('rejects browser origins before dispatch',async()=>{let count=0;const r=await run(async()=>{count++;return new Response('{}');},'{}',{origin:'https://example.com'});expect(r.status).toBe(403);expect(count).toBe(0);});
+it('rejects malformed JSON before dispatch',async()=>{let count=0;const r=await run(async()=>{count++;return new Response('{}');},'not-json');expect(r.status).toBe(400);expect(count).toBe(0);});
+it('bounds upstream response bytes',async()=>{let count=0;const r=await run(async()=>{count++;return new Response(new Uint8Array(32*1024*1024+1));},'{}');expect(r.status).toBe(502);expect(count).toBe(1);});
+
+it.each(['','Bearer wrong','Basic local-test-token'])('rejects absent or invalid local bearer before parsing or dispatch',async authorization=>{let count=0;const r=await run(async()=>{count++;return new Response('{}');},'not-json',{authorization});expect(r.status).toBe(401);expect(count).toBe(0);});
+it('requires a dispatch guard in configuration',()=>{expect(()=>createNativeApiProxy({apiKey:'k',workspaceId:'w',localBearerToken:'local-test-token'} as never)).toThrow('invalid proxy configuration');});
+it('calls the mandatory budget guard before fetch and denies rejected reservation',async()=>{
+ let calls=0;let guards=0;const server=createNativeApiProxy({apiKey:'key',workspaceId:'workspace',localBearerToken:'local-test-token',authorizeDispatch:async(request)=>{guards++;expect(request.model).toBe('example');throw Error('private guard details');},fetch:async()=>{calls++;return new Response('{}');}});await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));
+ try{const r=await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/messages`,{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer local-test-token'},body:'{"model":"example"}'});expect(r.status).toBe(429);expect(await r.text()).not.toContain('private guard details');expect(guards).toBe(1);expect(calls).toBe(0);}finally{await new Promise<void>(r=>server.close(()=>r()));}
+});
