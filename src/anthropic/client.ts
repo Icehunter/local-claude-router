@@ -13,10 +13,13 @@ export interface TextBlock {
   cache_control?: { type: "ephemeral"; ttl?: "5m" };
 }
 
-/** A content block of any type. Only `text` blocks are read by this server. */
+/** A content block of any type. The server reads `text` and `tool_use` blocks. */
 export interface ContentBlock {
   type: string;
   text?: string;
+  id?: string;
+  name?: string;
+  input?: unknown;
   [k: string]: unknown;
 }
 
@@ -30,8 +33,8 @@ export interface Message {
 export interface MessageRequest {
   responseTool?: string;
   responseEnvelope?: boolean;
-  tools?: {name: string; description: string; input_schema: Record<string, unknown>}[];
-  toolChoice?: {type: "auto"};
+  tools?: {name: string; description?: string; input_schema: Record<string, unknown>}[];
+  toolChoice?: {type: "auto"} | {type: "any"} | {type: "tool"; name: string};
   cacheControl?: { type: "ephemeral"; ttl?: "5m" };
   model: string;
   maxTokens: number;
@@ -457,6 +460,8 @@ function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortS
 export interface ClientCallOptions {
   readonly singleAttempt?: boolean;
   readonly onAttempt?: () => void;
+  /** Called before sleeping for a retry, with why the attempt failed. Never receives prompt or reply text. */
+  readonly onRetry?: (info: { attempt: number; delayMs: number; reason: string; status?: number; requestId?: string | null }) => void;
 }
 
 export class AnthropicClient {
@@ -654,6 +659,12 @@ export class AnthropicClient {
       if (delay > MAX_RETRY_WAIT_MS) {
         throw failure;
       }
+      callOptions.onRetry?.({
+        attempt: attempt + 1,
+        delayMs: delay,
+        reason: failure.message,
+        ...(failure instanceof APIStatusError ? { status: failure.status, requestId: failure.requestId } : {}),
+      });
       await this.sleep(delay);
     }
   }

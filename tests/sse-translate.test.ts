@@ -91,6 +91,26 @@ describe("translateSSE", () => {
     expect(finish!.choices[0]!.finish_reason).toBe("tool_calls");
   });
 
+  it("gives parallel tool_use blocks distinct tool_calls indices", async () => {
+    const ev = (event: string, data: unknown) => ({ event, data: JSON.stringify(data) });
+    const upstream = events(
+      ev("message_start", { type: "message", id: "m", usage: {} }),
+      ev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_a", name: "search" } }),
+      ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"q":"a"}' } }),
+      ev("content_block_stop", { type: "content_block_stop", index: 0 }),
+      ev("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_b", name: "fetch" } }),
+      ev("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"u":"b"}' } }),
+      ev("content_block_stop", { type: "content_block_stop", index: 1 }),
+      ev("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use", usage: { output_tokens: 2 } } }),
+    );
+    const chunks = await collect(translateSSE(upstream, "chatcmpl-1", "claude-sonnet-5-5", 1));
+    const toolDeltas = chunks.map((c) => c.choices[0]?.delta.tool_calls).filter((d) => d !== undefined) as Array<Array<Record<string, unknown>>>;
+    expect(toolDeltas).toEqual([
+      [{ index: 0, id: "toolu_a", type: "function", function: { name: "search", arguments: '{"q":"a"}' } }],
+      [{ index: 1, id: "toolu_b", type: "function", function: { name: "fetch", arguments: '{"u":"b"}' } }],
+    ]);
+  });
+
   it("maps stop reasons through the shared mapping", async () => {
     for (const [stop, expected] of [["max_tokens", "length"], ["stop_sequence", "stop"], ["refusal", "content_filter"]] as const) {
       const upstream = events(

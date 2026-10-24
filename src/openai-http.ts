@@ -10,7 +10,7 @@ import { pino } from "pino";
 import type { Logger } from "pino";
 import pretty from "pino-pretty";
 import { APIStatusError } from "./anthropic/client.js";
-import type { Message, MessageRequest, MessageResult, TextBlock } from "./anthropic/client.js";
+import type { ClientCallOptions, ContentBlock, Message, MessageRequest, MessageResult, TextBlock } from "./anthropic/client.js";
 import { isHaikuModel } from "./anthropic/headers.js";
 import { depsFromEnv, MAX_MAX_TOKENS } from "./deps.js";
 import type { Deps } from "./deps.js";
@@ -146,22 +146,154 @@ function contentText(content: OpenAIContent, where: string): string | TextBlock[
 }
 function blocks(content: string | TextBlock[]): TextBlock[] { return typeof content === "string" ? [{type:"text",text:content}] : content; }
 
+/** OpenAI fields that do not change what the model produces, or that upstream rejects. They are accepted and dropped. */
+const IGNORED_FIELDS: ReadonlySet<string> = new Set(["temperature", "top_p", "presence_penalty", "frequency_penalty", "stream_options", "user", "chat_template_kwargs"]);
+
 /**
  * Rejects fields this server cannot honor.
  *
  * @param body - Parsed request body.
- * @throws {HttpError} 400 for tools, functions, `tool_choice`, or `n` other than 1.
+ * @throws {HttpError} 400 for unknown fields, `n` other than 1, or
+ *   `parallel_tool_calls: false` (upstream always allows parallel calls).
  */
 function assertSupportedFeatures(body: Record<string, unknown>): void {
-  const allowed = new Set(["messages", "model", "max_tokens", "max_completion_tokens", "stream", "n", "thinking", "effort", "reasoning_effort", "cache_control", "response_format"]);
-  for (const key of Object.keys(body)) if (!allowed.has(key)) throw new HttpError(400, `unsupported request field: ${key}`);
+  const allowed = new Set(["messages", "model", "max_tokens", "max_completion_tokens", "stream", "n", "thinking", "effort", "reasoning_effort", "output_config", "cache_control", "response_format", "tools", "tool_choice"]);
+  for (const key of Object.keys(body)) {
+    if (IGNORED_FIELDS.has(key)) continue;
+    if (!allowed.has(key)) throw new HttpError(400, `unsupported request field: ${key}`);
+  }
   if (body.stream !== undefined && typeof body.stream !== "boolean") throw new HttpError(400, "stream must be boolean");
-  if (body.tools !== undefined || body.functions !== undefined || body.tool_choice !== undefined) {
-    throw new HttpError(400, "tools and function calling are not supported");
+  if (body.parallel_tool_calls !== undefined && body.parallel_tool_calls !== true) {
+    throw new HttpError(400, "parallel_tool_calls must be true; upstream always allows parallel tool calls");
   }
   if (body.n !== undefined && body.n !== 1) {
     throw new HttpError(400, "only n=1 is supported");
   }
+}
+
+/**
+ * Translates OpenAI `tools` and `tool_choice` into upstream form.
+ *
+ * Only `type: "function"` tools are accepted; a missing `parameters` becomes
+ * an empty object schema. `tool_choice` maps "auto" to auto, "required" to
+ * any, "none" drops the tools, and a named choice to the named tool.
+ *
+ * @param body - Parsed request body.
+ * @returns The upstream `tools` and optional `toolChoice`, or undefined when
+ *   the request sends no tools (or `tool_choice` is "none").
+ * @throws {HttpError} 400 for a malformed tool definition or tool choice.
+ */
+function resolveTools(body: Record<string, unknown>): {
+  tools: { name: string; description?: string; input_schema: Record<string, unknown> }[];
+  toolChoice?: { type: "auto" } | { type: "any" } | { type: "tool"; name: string };
+} | undefined {
+  const rawTools = body.tools;
+  if (rawTools !== undefined && !Array.isArray(rawTools)) throw new HttpError(400, "tools must be an array");
+  const tools = (rawTools as unknown[] | undefined)?.map((raw, index) => {
+    const where = `tools[${index}]`;
+    const tool = raw as Record<string, unknown> | null;
+    if (!tool || typeof tool !== "object" || Array.isArray(tool) || tool.type !== "function") {
+      throw new HttpError(400, `${where}: only type "function" tools are supported`);
+    }
+    const fn = tool.function as Record<string, unknown> | null;
+    if (!fn || typeof fn !== "object" || Array.isArray(fn)) throw new HttpError(400, `${where}.function must be an object`);
+    const name = fn.name;
+    if (typeof name !== "string" || name.length === 0 || name.length > 64 || !/^[a-zA-Z0-9_-]+$/.test(name)) {
+      throw new HttpError(400, `${where}.function.name must be 1-64 letters, digits, "-" or "_"`);
+    }
+    if (fn.description !== undefined && typeof fn.description !== "string") {
+      throw new HttpError(400, `${where}.function.description must be a string`);
+    }
+    const parameters = fn.parameters;
+    let input_schema: Record<string, unknown>;
+    if (parameters === undefined) {
+      input_schema = { type: "object", properties: {} };
+    } else if (parameters && typeof parameters === "object" && !Array.isArray(parameters)) {
+      input_schema = parameters as Record<string, unknown>;
+    } else {
+      throw new HttpError(400, `${where}.function.parameters must be a JSON schema object`);
+    }
+    return { name, ...(typeof fn.description === "string" ? { description: fn.description } : {}), input_schema };
+  });
+  if (tools) {
+    const seen = new Set<string>();
+    for (const tool of tools) {
+      if (seen.has(tool.name)) throw new HttpError(400, `duplicate tool name "${tool.name}"`);
+      seen.add(tool.name);
+    }
+  }
+  const rawChoice = body.tool_choice;
+  if (rawChoice === undefined) {
+    return tools?.length ? { tools } : undefined;
+  }
+  if (typeof rawChoice === "string") {
+    if (rawChoice === "auto") {
+      return tools?.length ? { tools, toolChoice: { type: "auto" } } : undefined;
+    }
+    if (rawChoice === "none") {
+      return undefined;
+    }
+    if (rawChoice === "required") {
+      if (!tools?.length) throw new HttpError(400, 'tool_choice "required" needs at least one tool');
+      return { tools, toolChoice: { type: "any" } };
+    }
+  }
+  if (rawChoice && typeof rawChoice === "object" && !Array.isArray(rawChoice)) {
+    const fn = (rawChoice as Record<string, unknown>).function as Record<string, unknown> | null;
+    if ((rawChoice as Record<string, unknown>).type !== "function" || !fn || typeof fn !== "object" || Array.isArray(fn)) {
+      throw new HttpError(400, 'tool_choice must be "auto", "none", "required" or { type: "function", function: { name } }');
+    }
+    const name = fn.name;
+    if (typeof name !== "string" || !tools?.some(tool => tool.name === name)) {
+      throw new HttpError(400, `tool_choice must name one of the provided tools, got "${String(name)}"`);
+    }
+    return { tools, toolChoice: { type: "tool", name } };
+  }
+  throw new HttpError(400, 'tool_choice must be "auto", "none", "required" or { type: "function", function: { name } }');
+}
+
+/**
+ * Translates one OpenAI `tool_call` into an upstream `tool_use` block.
+ *
+ * The client's tool call id is reused as the upstream `tool_use` id so the
+ * matching `tool_result` block carries the same reference.
+ *
+ * @param raw - One entry of an assistant message's `tool_calls` array.
+ * @param where - Location used in error messages.
+ * @returns The `tool_use` block.
+ * @throws {HttpError} 400 for a malformed tool call.
+ */
+function toToolUseBlock(raw: unknown, where: string): ContentBlock {
+  const call = raw as Record<string, unknown> | null;
+  if (!call || typeof call !== "object" || Array.isArray(call)) throw new HttpError(400, `${where} must be an object`);
+  const id = call.id;
+  if (typeof id !== "string" || id.length === 0 || id.length > 64 || !/^[a-zA-Z0-9_-]+$/.test(id)) {
+    throw new HttpError(400, `${where}.id must be 1-64 letters, digits, "-" or "_"`);
+  }
+  if (call.type !== undefined && call.type !== "function") {
+    throw new HttpError(400, `${where}: only type "function" tool calls are supported`);
+  }
+  const fn = call.function as Record<string, unknown> | null;
+  if (!fn || typeof fn !== "object" || Array.isArray(fn)) throw new HttpError(400, `${where}.function must be an object`);
+  const name = fn.name;
+  if (typeof name !== "string" || name.length === 0 || name.length > 64) {
+    throw new HttpError(400, `${where}.function.name must be a non-empty string`);
+  }
+  let input: Record<string, unknown> = {};
+  if (fn.arguments !== undefined) {
+    if (typeof fn.arguments !== "string") throw new HttpError(400, `${where}.function.arguments must be a JSON string`);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fn.arguments);
+    } catch {
+      throw new HttpError(400, `${where}.function.arguments is not valid JSON`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new HttpError(400, `${where}.function.arguments must decode to a JSON object`);
+    }
+    input = parsed as Record<string, unknown>;
+  }
+  return { type: "tool_use", id, name, input };
 }
 
 /** System text and conversation turns split out of an OpenAI `messages` array. */
@@ -174,34 +306,100 @@ interface SplitMessages {
  * Splits OpenAI messages into system text and alternating turns.
  *
  * `system` and `developer` messages are lifted out. Consecutive messages with
- * the same role are merged with a blank line between them, because the upstream
- * API requires roles to alternate.
+ * the same role are merged, because the upstream API requires roles to
+ * alternate. Assistant `tool_calls` become `tool_use` blocks, and `role:
+ * "tool"` messages become `tool_result` blocks in the user turn that follows
+ * the assistant turn. Every tool call must receive its result before the
+ * conversation continues.
  *
  * @param rawMessages - The request's `messages` array.
  * @returns The system texts and the merged turns.
- * @throws {HttpError} 400 for non-text content or an unsupported role.
+ * @throws {HttpError} 400 for non-text content, an unsupported role, or a
+ *   broken tool call / tool result pairing.
  */
 function splitMessages(rawMessages: unknown[]): SplitMessages {
   const system: TextBlock[] = [];
   const messages: Message[] = [];
+  /** Tool use ids from the most recent assistant turn still awaiting results. */
+  const pending: string[] = [];
+
+  /** Plain text blocks collapse to a string, matching the old wire shape. */
+  const collapseText = (content: ContentBlock[]): string | ContentBlock[] =>
+    content.length > 0 && content.every(block => block.type === "text" && block.cache_control === undefined)
+      ? content.map(block => String(block.text)).join("")
+      : content;
+
+  /** Appends a turn, merging it into the previous same-role turn. */
+  const pushTurn = (role: "user" | "assistant", content: string | ContentBlock[]): void => {
+    const next = typeof content === "string" ? [{ type: "text", text: content }] : content;
+    const last = messages[messages.length - 1];
+    if (last && last.role === role) {
+      const previous = typeof last.content === "string" ? [{ type: "text", text: last.content }] : last.content;
+      const separator = previous.some(block => block.type === "text") && next.some(block => block.type === "text")
+        ? [{ type: "text", text: "\n\n" }]
+        : [];
+      last.content = typeof last.content === "string" && typeof content === "string"
+        ? `${last.content}\n\n${content}`
+        : [...previous, ...separator, ...next];
+      return;
+    }
+    messages.push({ role, content: collapseText(next) });
+  };
+
   rawMessages.forEach((raw, index) => {
-    const message = raw as { role?: string; content?: OpenAIContent };
+    const message = raw as { role?: string; content?: OpenAIContent; tool_calls?: unknown[]; tool_call_id?: unknown };
     const where = `messages[${index}]`;
-    const text = contentText(message?.content, where);
     if (message.role === "system" || message.role === "developer") {
-      system.push(...blocks(text));
+      system.push(...blocks(contentText(message?.content, where)));
+      return;
+    }
+    if (message.role === "tool") {
+      const callId = message.tool_call_id;
+      if (typeof callId !== "string" || callId.length === 0) {
+        throw new HttpError(400, `${where}: tool message needs a non-empty tool_call_id`);
+      }
+      const position = pending.indexOf(callId);
+      if (position === -1) {
+        throw new HttpError(400, `${where}: tool result does not match a pending tool_call`);
+      }
+      pending.splice(position, 1);
+      const text = message.content === undefined || message.content === null ? "" : contentText(message.content, where);
+      pushTurn("user", [{ type: "tool_result", tool_use_id: callId, content: typeof text === "string" ? text : text.map(block => block.text).join("") }]);
       return;
     }
     if (message.role !== "user" && message.role !== "assistant") {
       throw new HttpError(400, `${where}: unsupported role "${String(message?.role)}"`);
     }
-    const last = messages[messages.length - 1];
-    if (last && last.role === message.role) {
-      last.content = typeof last.content === "string" && typeof text === "string" ? `${last.content}\n\n${text}` : [...blocks(last.content as string | TextBlock[]), {type:"text",text:"\n\n"}, ...blocks(text)];
-      return;
+    const hasCalls = message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+    if (message.tool_calls !== undefined && !Array.isArray(message.tool_calls)) {
+      throw new HttpError(400, `${where}.tool_calls must be an array`);
     }
-    messages.push({ role: message.role, content: text });
+    if (pending.length > 0 && (message.role === "user" || messages[messages.length - 1]?.role !== "assistant")) {
+      throw new HttpError(400, `missing tool result for tool_call "${pending[0]}"`);
+    }
+    let text: string | TextBlock[];
+    if (message.content === undefined || message.content === null) {
+      if (hasCalls) text = "";
+      else throw new HttpError(400, `${where}: content must be text`);
+    } else {
+      text = contentText(message.content, where);
+    }
+    const content: ContentBlock[] = [...(text === "" ? [] : blocks(text))];
+    if (hasCalls) {
+      message.tool_calls!.forEach((rawCall, callIndex) => {
+        const block = toToolUseBlock(rawCall, `${where}.tool_calls[${callIndex}]`);
+        if (pending.includes(block.id as string)) {
+          throw new HttpError(400, `${where}.tool_calls[${callIndex}]: duplicate tool_call id "${block.id}"`);
+        }
+        content.push(block);
+        pending.push(block.id as string);
+      });
+    }
+    pushTurn(message.role, hasCalls ? content : text);
   });
+  if (pending.length > 0) {
+    throw new HttpError(400, `missing tool result for tool_call "${pending[0]}"`);
+  }
   return { system, messages };
 }
 
@@ -265,7 +463,8 @@ function resolveModel(requested: unknown, defaultModel: string): string {
  *
  * Notes on fields:
  *
- * - Unsupported behavioral fields, including temperature, are rejected.
+ * - Unsupported behavioral fields are rejected; temperature, top_p, penalties, stream_options, user and chat_template_kwargs (a local-model template option) are ignored.
+ * - `tools` and `tool_choice` are translated to upstream tool use; `role: "tool"` messages become tool results. `response_format` cannot be combined with them.
  * - Explicit models must match the configured model (optionally with [1m]).
  * - `system` and `developer` messages become the system prompt, joined by a blank line.
  *
@@ -306,6 +505,9 @@ export function translateRequest(
   }
   const schema = responseTool(body.response_format);
   if (schema) {
+    if (body.tools !== undefined || body.tool_choice !== undefined) {
+      throw new HttpError(400, "response_format cannot be combined with tools or tool_choice");
+    }
     request.tools = [{name:"respond",description:"Return the requested JSON result.",input_schema:schema.schema}];
     request.toolChoice = {type:"auto"};
     request.responseTool = "respond";
@@ -314,6 +516,12 @@ export function translateRequest(
       ? 'Use the respond tool exactly once. Put the requested JSON object in its required result property. Do not return the result as plain text.'
       : 'Use the respond tool exactly once to return the requested JSON result. Its input is the result. Do not return the result as plain text.';
     request.system = request.system === undefined ? instruction : typeof request.system === "string" ? request.system + "\n\n" + instruction : [...request.system,{type:"text",text:instruction}];
+  } else {
+    const resolved = resolveTools(body);
+    if (resolved) {
+      request.tools = resolved.tools;
+      if (resolved.toolChoice) request.toolChoice = resolved.toolChoice;
+    }
   }
   return request;
 }
@@ -335,7 +543,9 @@ function responseText(result: MessageResult): string {
  * Converts an upstream message response to an OpenAI `chat.completion`.
  *
  * `stop_reason` maps to `finish_reason` through {@link FINISH_REASONS}; anything
- * unknown remains unknown. Missing usage remains null.
+ * unknown remains unknown. Missing usage remains null. `tool_use` blocks are
+ * surfaced as `tool_calls` unless the response is being checked against the
+ * `response_format` protocol tool.
  *
  * @param result - Upstream result.
  * @param created - Creation time in epoch seconds.
@@ -358,7 +568,15 @@ export function toChatCompletion(result: MessageResult, created: number, expecte
   const tool = toolBlocks.length === 1 && toolBlocks[0]!.name === expectedTool && typeof toolBlocks[0]!.input === "object" && toolBlocks[0]!.input !== null && !Array.isArray(toolBlocks[0]!.input) ? toolBlocks[0] : undefined;
   const envelopeValid = !envelope || tool !== undefined && Object.keys(tool.input as object).length === 1 && Object.hasOwn(tool.input as object,"result") && typeof (tool.input as Record<string,unknown>).result === "object" && (tool.input as Record<string,unknown>).result !== null && !Array.isArray((tool.input as Record<string,unknown>).result);
   const validTool = envelopeValid && tool !== undefined && response.stop_reason === "tool_use" && blockTypes.every(type=>["text","thinking","redacted_thinking","tool_use"].includes(type));
-  const unexpected = blockTypes.some(type => !["text", "thinking", "redacted_thinking"].includes(type));
+  const unexpected = blockTypes.some(type => !["text", "thinking", "redacted_thinking", "tool_use"].includes(type));
+  /** Tool calls surfaced to OpenAI clients; absent for the `response_format` protocol. */
+  const toolCalls = expectedTool === undefined && toolBlocks.length > 0
+    ? toolBlocks.map(block => ({
+        id: String(block.id ?? ""),
+        type: "function" as const,
+        function: { name: String(block.name ?? ""), arguments: JSON.stringify(block.input && typeof block.input === "object" && !Array.isArray(block.input) ? block.input : {}) },
+      }))
+    : undefined;
   return {
     id: `chatcmpl-${response.id}`,
     object: "chat.completion",
@@ -367,8 +585,12 @@ export function toChatCompletion(result: MessageResult, created: number, expecte
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content: expectedTool ? validTool ? JSON.stringify(envelope ? (tool!.input as Record<string,unknown>).result : tool!.input) : "" : responseText(result) },
-        finish_reason: expectedTool ? validTool ? "stop" : "unsupported_content" : unexpected ? "unsupported_content" : FINISH_REASONS[response.stop_reason ?? ""] ?? DEFAULT_FINISH_REASON,
+        message: {
+          role: "assistant",
+          content: expectedTool ? validTool ? JSON.stringify(envelope ? (tool!.input as Record<string,unknown>).result : tool!.input) : "" : responseText(result),
+          ...(toolCalls ? { tool_calls: toolCalls } : {}),
+        },
+        finish_reason: expectedTool ? validTool ? "stop" : "unsupported_content" : toolCalls ? "tool_calls" : unexpected ? "unsupported_content" : FINISH_REASONS[response.stop_reason ?? ""] ?? DEFAULT_FINISH_REASON,
       },
     ],
     usage,
@@ -443,6 +665,25 @@ function relayedStatus(err: APIStatusError): number {
 }
 
 /**
+ * Records why a request failed in the log fields. Never includes prompts or replies.
+ *
+ * @param detail - Log fields, mutated in place.
+ * @param err - Whatever was thrown.
+ */
+function recordFailure(detail: RequestLogDetail, err: unknown): void {
+  detail.error = (err as Error)?.message ?? String(err);
+  detail.errorName = (err as Error)?.name ?? typeof err;
+  if (err instanceof APIStatusError) {
+    detail.upstreamStatus = err.status;
+    detail.upstreamErrorType = err.errorType;
+    detail.upstreamRequestId = err.requestId;
+    if (err.retryAfterMs > 0) detail.upstreamRetryAfterMs = err.retryAfterMs;
+  } else if (err instanceof HttpError) {
+    detail.errorType = err.type;
+  }
+}
+
+/**
  * Answers a request that failed, if the response has not started.
  *
  * If headers were already sent the connection is simply ended.
@@ -494,10 +735,28 @@ function buildUpstreamRequest(body: Record<string, unknown>, deps: OpenAIHttpDep
       throw new HttpError(400, `${field} must be one of ${EFFORTS.join(", ")}`);
     }
   }
+  let configEffort: Effort | undefined;
+  const rawConfig = body.output_config as Record<string, unknown> | null | undefined;
+  if (rawConfig !== undefined) {
+    if (rawConfig === null || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
+      throw new HttpError(400, "output_config must be an object");
+    }
+    for (const key of Object.keys(rawConfig)) {
+      if (key !== "effort") throw new HttpError(400, `unsupported output_config field: ${key}`);
+    }
+    if (rawConfig.effort !== undefined && (typeof rawConfig.effort !== "string" || !isEffort(rawConfig.effort))) {
+      throw new HttpError(400, `output_config.effort must be one of ${EFFORTS.join(", ")}`);
+    }
+    configEffort = rawConfig.effort as Effort | undefined;
+  }
   if (body.effort !== undefined && body.reasoning_effort !== undefined && body.effort !== body.reasoning_effort) {
     throw new HttpError(400, "effort and reasoning_effort must agree when both are supplied");
   }
-  const effort = body.effort ?? body.reasoning_effort ?? deps.effort;
+  const topLevelEffort = body.effort ?? body.reasoning_effort;
+  if (topLevelEffort !== undefined && configEffort !== undefined && topLevelEffort !== configEffort) {
+    throw new HttpError(400, "effort and output_config.effort must agree when both are supplied");
+  }
+  const effort = topLevelEffort ?? configEffort ?? deps.effort;
   if (effort !== undefined) {
     request.effort = effort as Effort;
   }
@@ -547,6 +806,8 @@ async function handleStream(
       }
     }
   } catch (err) {
+    recordFailure(detail, err);
+    detail.streamFailed = detail.clientDisconnected !== true;
     sendFailure(response, err);
   } finally {
     if (!response.writableEnded) {
@@ -586,6 +847,7 @@ async function handleChatCompletion(
   const abort = new AbortController();
   response.on("close", () => {
     if (!response.writableEnded) {
+      detail.clientDisconnected = true;
       abort.abort();
     }
   });
@@ -596,13 +858,15 @@ async function handleChatCompletion(
 
   const singleAttempt = incomingRequest.headers["x-pinkie-single-attempt"] === "1";
   let upstreamAttempts = 0;
-  const result = singleAttempt
-    ? await deps.client.createMessage(request, abort.signal, { singleAttempt: true, onAttempt: () => {
-        upstreamAttempts++;
-        detail.upstreamAttempts = upstreamAttempts;
-        response.setHeader("x-claude-wire-upstream-attempts", String(upstreamAttempts));
-      } })
-    : await deps.client.createMessage(request, abort.signal);
+  const onAttempt = (): void => {
+    upstreamAttempts++;
+    detail.upstreamAttempts = upstreamAttempts;
+    response.setHeader("x-claude-wire-upstream-attempts", String(upstreamAttempts));
+  };
+  const onRetry: NonNullable<ClientCallOptions["onRetry"]> = info => {
+    deps.log?.warn({ ...info, model: request.model }, `upstream attempt ${info.attempt} failed, retrying in ${info.delayMs}ms`);
+  };
+  const result = await deps.client.createMessage(request, abort.signal, { singleAttempt, onAttempt, onRetry });
   const completion = toChatCompletion(result, now(), request.responseTool, request.responseEnvelope);
 
   detail.finish = completion.choices[0]!.finish_reason;
@@ -695,14 +959,23 @@ export function createOpenAIHttpServer(deps: OpenAIHttpDeps): Server {
     const path = pathOf(incomingRequest.url);
     // Request metadata only: prompts and replies are never logged.
     const detail: RequestLogDetail = {};
+    const logFinished = (status: number, message: string): void => {
+      const level = detail.streamFailed ? "error" : logLevelFor(status);
+      log[level]({ ...detail, ms: Date.now() - started }, message);
+    };
     response.on("finish", () => {
       const status = response.statusCode;
-      log[logLevelFor(status)]({ ...detail, ms: Date.now() - started }, `${method} ${path} ${status}`);
+      logFinished(status, `${method} ${path} ${status}${detail.streamFailed ? " (stream failed after headers sent)" : ""}`);
+    });
+    response.on("close", () => {
+      if (!response.writableFinished) {
+        logFinished(499, `${method} ${path} client disconnected before the response finished`);
+      }
     });
     try {
       await route(incomingRequest, response, path, deps, now, detail);
     } catch (err) {
-      detail.error = (err as Error).message;
+      recordFailure(detail, err);
       sendFailure(response, err);
     }
   });

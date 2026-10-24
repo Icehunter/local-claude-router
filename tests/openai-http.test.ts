@@ -54,7 +54,7 @@ describe("translateRequest", () => {
   it("forwards any explicit model unchanged and still rejects unsupported fields", () => {
     expect(translateRequest({model:"claude-haiku-4-5",messages:[{role:"user",content:"x"}]},defaults).model).toBe("claude-haiku-4-5");
     expect(translateRequest({model:"anthropic/claude-haiku-4-5[1m]",messages:[{role:"user",content:"x"}]},defaults).model).toBe("anthropic/claude-haiku-4-5[1m]");
-    expect(() => translateRequest({temperature:1.8,messages:[{role:"user",content:"x"}]},defaults)).toThrow("unsupported request field: temperature");
+    expect(() => translateRequest({stop:["x"],messages:[{role:"user",content:"x"}]},defaults)).toThrow("unsupported request field: stop");
     expect(translateRequest({max_tokens:50,messages:[{role:"user",content:"x"}]},defaults)).toMatchObject({model:"claude-sonnet-5-5",maxTokens:50});
   });
 
@@ -67,13 +67,126 @@ describe("translateRequest", () => {
   });
 
   it.each([
-    [{ messages: [{ role: "user", content: "x" }], tools: [] }],
     [{ messages: [] }],
     [{ messages: [{ role: "assistant", content: "x" }] }],
     [{ messages: [{ role: "user", content: [{ type: "image_url" }] }] }],
     [{ messages: [{ role: "user", content: "x" }], max_tokens: 0 }],
+    [{ messages: [{ role: "user", content: "x" }], tools: "search" }],
+    [{ messages: [{ role: "user", content: "x" }], tools: [{ type: "custom", function: { name: "a" } }] }],
+    [{ messages: [{ role: "user", content: "x" }], tools: [{ type: "function", function: { name: "a b" } }] }],
+    [{ messages: [{ role: "user", content: "x" }], tools: [{ type: "function", function: { name: "a", description: 3 } }] }],
+    [{ messages: [{ role: "user", content: "x" }], tools: [{ type: "function", function: { name: "a", parameters: [] } }] }],
+    [{ messages: [{ role: "user", content: "x" }], tools: [{ type: "function", function: { name: "a" } }, { type: "function", function: { name: "a" } }] }],
+    [{ messages: [{ role: "user", content: "x" }], tool_choice: "sometimes" }],
+    [{ messages: [{ role: "user", content: "x" }], tool_choice: { type: "function", function: { name: "a" } } }],
+    [{ messages: [{ role: "user", content: "x" }], tools: [{ type: "function", function: { name: "a" } }], tool_choice: { type: "function", function: { name: "b" } } }],
+    [{ messages: [{ role: "user", content: "x" }], tool_choice: "required" }],
+    [{ messages: [{ role: "user", content: "x" }], parallel_tool_calls: false }],
+    [{ messages: [{ role: "user", content: "x" }], tools: [{ type: "function", function: { name: "a" } }], response_format: { type: "json_schema", json_schema: { name: "out", schema: { type: "object" } } } }],
   ])("rejects %j", (body) => {
     expect(() => translateRequest(body, defaults)).toThrow();
+  });
+
+  it("accepts an empty tools array and sends no tools upstream", () => {
+    const translated = translateRequest({ messages: [{ role: "user", content: "x" }], tools: [] }, defaults);
+    expect(translated.tools).toBeUndefined();
+    expect(translated.toolChoice).toBeUndefined();
+  });
+
+  it("translates tools and tool_choice to the upstream shape", () => {
+    const translated = translateRequest(
+      {
+        messages: [{ role: "user", content: "x" }],
+        tools: [{ type: "function", function: { name: "search", description: "find things", parameters: { type: "object", properties: { q: { type: "string" } } } } }],
+        tool_choice: "required",
+      },
+      defaults,
+    );
+    expect(translated.tools).toEqual([{ name: "search", description: "find things", input_schema: { type: "object", properties: { q: { type: "string" } } } }]);
+    expect(translated.toolChoice).toEqual({ type: "any" });
+  });
+
+  it("defaults missing parameters to an empty object schema and omits tool_choice for auto", () => {
+    const translated = translateRequest(
+      { messages: [{ role: "user", content: "x" }], tools: [{ type: "function", function: { name: "ping" } }], tool_choice: "auto" },
+      defaults,
+    );
+    expect(translated.tools).toEqual([{ name: "ping", input_schema: { type: "object", properties: {} } }]);
+    expect(translated.toolChoice).toEqual({ type: "auto" });
+  });
+
+  it("maps a named tool_choice and drops tools for tool_choice none", () => {
+    const named = translateRequest(
+      { messages: [{ role: "user", content: "x" }], tools: [{ type: "function", function: { name: "ping" } }], tool_choice: { type: "function", function: { name: "ping" } } },
+      defaults,
+    );
+    expect(named.toolChoice).toEqual({ type: "tool", name: "ping" });
+    const none = translateRequest(
+      { messages: [{ role: "user", content: "x" }], tools: [{ type: "function", function: { name: "ping" } }], tool_choice: "none" },
+      defaults,
+    );
+    expect(none.tools).toBeUndefined();
+    expect(none.toolChoice).toBeUndefined();
+  });
+
+  it("turns assistant tool_calls and tool messages into tool_use and tool_result blocks", () => {
+    const translated = translateRequest(
+      {
+        messages: [
+          { role: "user", content: "what is 2+2?" },
+          { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "calc", arguments: '{"a":2,"b":2}' } }] },
+          { role: "tool", tool_call_id: "call_1", content: "4" },
+          { role: "user", content: "thanks" },
+        ],
+        tools: [{ type: "function", function: { name: "calc" } }],
+      },
+      defaults,
+    );
+    expect(translated.messages).toEqual([
+      { role: "user", content: "what is 2+2?" },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "calc", input: { a: 2, b: 2 } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "4" }, { type: "text", text: "thanks" }] },
+    ]);
+  });
+
+  it("merges parallel tool calls and their results, keeping text alongside tool_use", () => {
+    const translated = translateRequest(
+      {
+        messages: [
+          { role: "user", content: "go" },
+          { role: "assistant", content: "checking both", tool_calls: [
+            { id: "call_a", type: "function", function: { name: "calc", arguments: "{}" } },
+            { id: "call_b", type: "function", function: { name: "calc" } },
+          ] },
+          { role: "tool", tool_call_id: "call_b", content: "second" },
+          { role: "tool", tool_call_id: "call_a", content: "first" },
+        ],
+        tools: [{ type: "function", function: { name: "calc" } }],
+      },
+      defaults,
+    );
+    expect(translated.messages).toEqual([
+      { role: "user", content: "go" },
+      { role: "assistant", content: [{ type: "text", text: "checking both" }, { type: "tool_use", id: "call_a", name: "calc", input: {} }, { type: "tool_use", id: "call_b", name: "calc", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_b", content: "second" }, { type: "tool_result", tool_use_id: "call_a", content: "first" }] },
+    ]);
+  });
+
+  it.each([
+    [// user text before the tool result
+      [{ role: "user", content: "go" }, { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "calc", arguments: "{}" } }] }, { role: "user", content: "never mind" }]],
+    [// result for an unknown call
+      [{ role: "user", content: "go" }, { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "calc", arguments: "{}" } }] }, { role: "tool", tool_call_id: "call_2", content: "x" }]],
+    [// missing result at the end
+      [{ role: "user", content: "go" }, { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "calc", arguments: "{}" } }] }, { role: "tool", tool_call_id: "call_1", content: "ok" }, { role: "assistant", content: null, tool_calls: [{ id: "call_2", type: "function", function: { name: "calc", arguments: "{}" } }] }]],
+    [// duplicate call id
+      [{ role: "user", content: "go" }, { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "calc", arguments: "{}" } }, { id: "call_1", type: "function", function: { name: "calc", arguments: "{}" } }] }, { role: "tool", tool_call_id: "call_1", content: "a" }, { role: "tool", tool_call_id: "call_1", content: "b" }]],
+    [// invalid arguments
+      [{ role: "user", content: "go" }, { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "calc", arguments: "{nope" } }] }, { role: "tool", tool_call_id: "call_1", content: "ok" }]],
+    [// tool message without tool_call_id
+      [{ role: "user", content: "go" }, { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "calc", arguments: "{}" } }] }, { role: "tool", content: "x" }]],
+  ])("rejects broken tool history %j", (messages) => {
+    expect(() => translateRequest({ messages, tools: [{ type: "function", function: { name: "calc" } }] }, defaults)).toThrow();
   });
 });
 
@@ -196,6 +309,46 @@ describe("http server", () => {
     { effort: "" }, { effort: "MEDIUM" }, { effort: "medium", reasoning_effort: "high" },
     { effort: "medium", reasoning_effort: null },
   ])("rejects malformed or conflicting effort without an upstream call: %j", async (fields) => {
+    const { url, seen } = await start(undefined, "high");
+    const response = await post(url, { ...fields, messages: [{ role: "user", content: "ping" }] });
+    expect(response.status).toBe(400);
+    expect(seen).toHaveLength(0);
+  });
+
+  it("forwards output_config.effort over the startup fallback", async () => {
+    const { url, seen } = await start(undefined, "high");
+    const response = await post(url, { output_config: { effort: "medium" }, messages: [{ role: "user", content: "ping" }] });
+    expect(response.status).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.effort).toBe("medium");
+  });
+
+  it.each(["low", "medium", "high", "xhigh", "max"])("accepts all effort aliases agreeing for %s", async (effort) => {
+    const { url, seen } = await start();
+    const body = { effort, reasoning_effort: effort, output_config: { effort }, messages: [{ role: "user", content: "ping" }] };
+    expect((await post(url, body)).status).toBe(200);
+    expect(seen[0]!.effort).toBe(effort);
+  });
+
+  it("prefers top-level effort over output_config.effort when they agree", async () => {
+    const { url, seen } = await start();
+    expect((await post(url, { effort: "low", output_config: { effort: "low" }, messages: [{ role: "user", content: "ping" }] })).status).toBe(200);
+    expect(seen[0]!.effort).toBe("low");
+  });
+
+  it("retains startup effort when output_config has no effort key", async () => {
+    const { url, seen } = await start(undefined, "high");
+    expect((await post(url, { output_config: {}, messages: [{ role: "user", content: "ping" }] })).status).toBe(200);
+    expect(seen[0]!.effort).toBe("high");
+  });
+
+  it.each([
+    { output_config: { effort: "extreme" } }, { output_config: { effort: null } }, { output_config: { effort: {} } },
+    { output_config: { effort: "" } }, { output_config: { effort: "MEDIUM" } },
+    { output_config: { temperature: 1 } }, { output_config: "medium" }, { output_config: null }, { output_config: [] },
+    { effort: "medium", output_config: { effort: "high" } },
+    { effort: "medium", reasoning_effort: "medium", output_config: { effort: "high" } },
+  ])("rejects malformed or conflicting output_config without an upstream call: %j", async (fields) => {
     const { url, seen } = await start(undefined, "high");
     const response = await post(url, { ...fields, messages: [{ role: "user", content: "ping" }] });
     expect(response.status).toBe(400);

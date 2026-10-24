@@ -44,10 +44,17 @@ export class HttpError extends Error {
   }
 }
 
+/** One entry of an OpenAI `tool_calls` array. */
+export interface ChatCompletionToolCall {
+  readonly id: string;
+  readonly type: "function";
+  readonly function: { readonly name: string; readonly arguments: string };
+}
+
 /** One choice of a non-streaming chat completion. */
 export interface ChatCompletionChoice {
   readonly index: number;
-  readonly message: { readonly role: "assistant"; readonly content: string };
+  readonly message: { readonly role: "assistant"; readonly content: string; readonly tool_calls?: readonly ChatCompletionToolCall[] };
   readonly finish_reason: string;
 }
 
@@ -90,7 +97,15 @@ export function toSseChunks(completion: ChatCompletion): string {
   };
   const first = {
     ...base,
-    choices: [{ index: 0, delta: { role: "assistant", content: choice.message.content }, finish_reason: null }],
+    choices: [{
+      index: 0,
+      delta: {
+        role: "assistant",
+        content: choice.message.content === "" ? null : choice.message.content,
+        ...(choice.message.tool_calls ? { tool_calls: choice.message.tool_calls } : {}),
+      },
+      finish_reason: null,
+    }],
   };
   const last = {
     ...base,
@@ -106,10 +121,11 @@ export function toSseChunks(completion: ChatCompletion): string {
  * stream lines.
  *
  * The generator yields `data: <json>\n\n` lines in this order: a role chunk on
- * `message_start`, one content chunk per text delta, a single `tool_calls`
- * delta when a tool_use block stops, a finish-reason chunk on `message_delta`,
- * a usage chunk, and finally the `[DONE]` sentinel. Events the translator does
- * not recognise are skipped.
+ * `message_start`, one content chunk per text delta, one `tool_calls` delta
+ * per stopped tool_use block (with a distinct `index` per block, so parallel
+ * calls stay separate), a finish-reason chunk on `message_delta`, a usage
+ * chunk, and finally the `[DONE]` sentinel. Events the translator does not
+ * recognise are skipped.
  *
  * @param upstreamEvents - An async iterable of `{ event, data }` pairs.
  * @param completionId - OpenAI id echoed on every chunk.
@@ -136,6 +152,7 @@ export async function* translateSSE(
   let toolId = "";
   let toolName = "";
   let toolArgs = "";
+  let toolCallIndex = -1;
   let stopReason: string | null = null;
   let inputTokens = 0;
   let outputTokens = 0;
@@ -165,6 +182,7 @@ export async function* translateSSE(
         toolId = block.id ?? "";
         toolName = block.name ?? "";
         toolArgs = "";
+        toolCallIndex += 1;
       }
     } else if (event === "content_block_delta") {
       if (delta?.type === "text_delta") {
@@ -174,7 +192,7 @@ export async function* translateSSE(
       }
     } else if (event === "content_block_stop") {
       if (toolId !== "") {
-        yield emit([{ index: 0, delta: { tool_calls: [{ index: 0, id: toolId, type: "function", function: { name: toolName, arguments: toolArgs } }] }, finish_reason: null }]);
+        yield emit([{ index: 0, delta: { tool_calls: [{ index: toolCallIndex, id: toolId, type: "function", function: { name: toolName, arguments: toolArgs } }] }, finish_reason: null }]);
         toolId = "";
         toolName = "";
         toolArgs = "";

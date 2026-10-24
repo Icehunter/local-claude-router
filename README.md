@@ -32,12 +32,20 @@ Point the app at `http://127.0.0.1:8787/v1`. The API key is ignored unless `CLAU
 
 Each request logs method, path, status, model, token counts and duration. Prompts and replies are never logged.
 
+## Function calling
+
+`tools` (`type: "function"` only), `tool_choice` (`auto`, `none`, `required`, or a named function) and `role: "tool"` messages are translated to upstream tool use. Client tool call ids travel through the history unchanged. The model's tool calls come back as OpenAI `tool_calls` with `finish_reason: "tool_calls"`, in streaming and non-streaming responses alike. `response_format` cannot be combined with `tools` or `tool_choice`.
+
+## Effort
+
+Per-request `effort`, `reasoning_effort` and `output_config: { effort }` all set the effort (sent upstream as `output_config.effort`); when several are given they must agree, otherwise `CLAUDE_WIRE_EFFORT` applies. Any other `output_config` field is a 400.
+
 ## What it does not do
 
-- No tools or function calling, no image parts, `n` must be 1 (400 otherwise).
-- `stream: true` returns the full answer as one chunk, then `[DONE]`; the upstream call is not streaming.
+- No image parts, `n` must be 1 (400 otherwise).
+- `parallel_tool_calls: false` is rejected: the upstream always allows parallel calls.
 - `temperature` is accepted and dropped: the upstream rejects it for current models.
-- `response_format` is ignored, so JSON replies may arrive in a code fence.
+- `response_format` accepts only nonstrict `json_schema`; other shapes are a 400.
 
 ## Development
 
